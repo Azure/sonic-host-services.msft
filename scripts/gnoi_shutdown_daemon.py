@@ -243,9 +243,9 @@ class GnoiRebootHandler:
             "-rpc", "Reboot",
             "-jsonin", json.dumps({"method": REBOOT_METHOD_HALT, "message": "Triggered by SmartSwitch graceful shutdown"})
         ]
-        rc, out, err = execute_command(reboot_cmd, timeout_sec=REBOOT_RPC_TIMEOUT_SEC, suppress_stderr=True)
+        rc, out, err = execute_command(reboot_cmd, timeout_sec=REBOOT_RPC_TIMEOUT_SEC)
         if rc != 0:
-            logger.log_error(f"{dpu_name}: Reboot command failed")
+            logger.log_error(f"{dpu_name}: Reboot command failed (rc={rc}, target={dpu_ip}:{port}): {err}")
             return False
         return True
 
@@ -293,15 +293,6 @@ class GnoiRebootHandler:
 # #########
 
 def main():
-    # Check if this is a SmartSwitch NPU platform - exit gracefully if not
-    try:
-        if not (device_info.is_smartswitch() and not is_dpu()):
-            logger.log_notice("Not a SmartSwitch NPU platform, exiting gracefully")
-            return
-    except (ImportError, AttributeError, RuntimeError) as e:
-        logger.log_notice(f"Platform check failed ({e}), exiting gracefully")
-        return
-
     # Connect for STATE_DB (for gnoi_halt_in_progress flag) and CONFIG_DB
     state_db = daemon_base.db_connect("STATE_DB")
     config_db = daemon_base.db_connect("CONFIG_DB")
