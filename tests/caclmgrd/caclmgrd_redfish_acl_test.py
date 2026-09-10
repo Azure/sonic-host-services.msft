@@ -90,10 +90,10 @@ class TestCaclmgrdRedfishAcl(TestCase):
                          "but found tcp/443 rules: {}".format(port_443_rules))
 
     @patchfs
-    def test_handle_redfish_feature_events(self, fs):
+    def test_handle_feature_state_events_redfish(self, fs):
         """
-            Drive handle_redfish_feature_events (the FEATURE-table subscription
-            handler) directly, covering every branch: enable transition, disable
+            Drive handle_feature_state_events (the FEATURE-table subscription
+            handler) directly for REDFISH: enable transition, disable
             transition, non-redfish event ignored, and same-state no-op.
         """
         if not os.path.exists(DBCONFIG_PATH):
@@ -118,28 +118,28 @@ class TestCaclmgrdRedfishAcl(TestCase):
 
         # enable: flag flips True and namespace queued for re-walk
         notif = set()
-        caclmgrd_daemon.handle_redfish_feature_events(
+        caclmgrd_daemon.handle_feature_state_events(
             sub_with([("redfish", "SET", (("state", "enabled"),))]), "", notif)
         self.assertTrue(caclmgrd_daemon.RedfishAllowed)
         self.assertIn("", notif)
 
         # disable: flag flips False and namespace queued
         notif = set()
-        caclmgrd_daemon.handle_redfish_feature_events(
+        caclmgrd_daemon.handle_feature_state_events(
             sub_with([("redfish", "SET", (("state", "disabled"),))]), "", notif)
         self.assertFalse(caclmgrd_daemon.RedfishAllowed)
         self.assertIn("", notif)
 
         # non-redfish FEATURE event: ignored, nothing queued
         notif = set()
-        caclmgrd_daemon.handle_redfish_feature_events(
+        caclmgrd_daemon.handle_feature_state_events(
             sub_with([("snmp", "SET", (("state", "enabled"),))]), "", notif)
         self.assertFalse(caclmgrd_daemon.RedfishAllowed)
         self.assertEqual(notif, set())
 
         # same-state event (already disabled): no-op, nothing queued
         notif = set()
-        caclmgrd_daemon.handle_redfish_feature_events(
+        caclmgrd_daemon.handle_feature_state_events(
             sub_with([("redfish", "SET", (("state", "disabled"),))]), "", notif)
         self.assertFalse(caclmgrd_daemon.RedfishAllowed)
         self.assertEqual(notif, set())
