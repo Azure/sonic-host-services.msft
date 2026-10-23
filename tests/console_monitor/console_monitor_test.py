@@ -3187,8 +3187,6 @@ class TestConsoleLoggingCoverage(TestCase):
                     self.assertNotIn("occurrences", mock_error.call_args_list[0][0][0])
                     self.assertIn("3 occurrences", mock_error.call_args_list[1][0][0])
 
-    @mock.patch.object(console_monitor, 'MirrorControlServer')
-    @mock.patch.object(console_monitor, 'MirrorManager')
     @mock.patch.object(console_monitor, 'configure_serial')
     @mock.patch.object(console_monitor, 'set_nonblocking')
     @mock.patch('os.pipe', return_value=(10, 11))
@@ -3233,8 +3231,6 @@ class TestConsoleLoggingCoverage(TestCase):
                     self.assertEqual(set_fields[console_monitor.LOGGING_STATUS_KEY], "failed")
                     self.assertIn("permission denied", set_fields[console_monitor.LOGGING_ERROR_KEY])
 
-    @mock.patch.object(console_monitor, 'MirrorControlServer')
-    @mock.patch.object(console_monitor, 'MirrorManager')
     @mock.patch.object(console_monitor, 'configure_serial')
     @mock.patch.object(console_monitor, 'set_nonblocking')
     @mock.patch('os.pipe', return_value=(10, 11))
@@ -3273,8 +3269,6 @@ class TestConsoleLoggingCoverage(TestCase):
         self.assertEqual(set_fields[console_monitor.LOGGING_STATUS_KEY], "active")
         proxy.state_table.hdel.assert_any_call("1", console_monitor.LOGGING_ERROR_KEY)
 
-    @mock.patch.object(console_monitor, 'MirrorControlServer')
-    @mock.patch.object(console_monitor, 'MirrorManager')
     @mock.patch.object(console_monitor, 'configure_serial')
     @mock.patch.object(console_monitor, 'set_nonblocking')
     @mock.patch('os.pipe', return_value=(10, 11))
