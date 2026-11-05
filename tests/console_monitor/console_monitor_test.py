@@ -220,10 +220,12 @@ class TestDCEService(TestCase):
         self.assertEqual(configs["1"]["log_file"], "/var/log/console-1.log")
         self.assertEqual(configs["1"]["logrotate_size"], "10M")
         self.assertEqual(configs["1"]["logrotate_count"], "10")
+        self.assertEqual(configs["1"]["flow_control"], "0")
         
         # Verify port 2 config
         self.assertIn("2", configs)
         self.assertEqual(configs["2"]["baud"], 115200)
+        self.assertEqual(configs["2"]["flow_control"], "1")
         
         # Verify port 3 config
         self.assertIn("3", configs)
@@ -424,6 +426,231 @@ class TestDCEService(TestCase):
 # ============================================================
 # Frame Protocol Tests
 # ============================================================
+
+class TestProxyInputBackpressure(TestCase):
+    """UART backpressure must bound PTM reads without dropping input."""
+
+    def setUp(self):
+        self.proxy = console_monitor.ProxyService("1")
+        self.proxy.running = True
+        self.proxy.ser_fd = 10
+        self.proxy.ptm_fd = 11
+        self.proxy._wake_r = 12
+        self.proxy._last_heartbeat_time = time.monotonic()
+
+    @parameterized.expand([
+        ("partial", 2),
+        ("eagain", BlockingIOError(errno.EAGAIN, "UART full")),
+        ("eintr", InterruptedError(errno.EINTR, "interrupted")),
+    ])
+    def test_input_is_retried_without_loss(self, _, first_result):
+        proxy = self.proxy
+        proxy._serial_tx_pending.extend(b"abcdef")
+        with mock.patch.object(console_monitor.os, "write", side_effect=[
+                first_result, 4 if first_result == 2 else 6,
+        ]) as write:
+            proxy._flush_serial_tx()
+            expected_tail = b"cdef" if first_result == 2 else b"abcdef"
+            self.assertEqual(proxy._serial_tx_pending, expected_tail)
+            proxy._flush_serial_tx()
+        self.assertEqual(write.call_args_list, [
+            mock.call(10, b"abcdef"), mock.call(10, expected_tail),
+        ])
+        self.assertFalse(proxy._serial_tx_pending)
+        self.assertTrue(proxy.running)
+
+    def test_queue_is_bounded_to_one_ptm_read(self):
+        proxy = self.proxy
+        with mock.patch.object(console_monitor.os, "read", return_value=b"x" * 4096) as read:
+            for _ in range(10):
+                proxy._on_ptm_read()
+        read.assert_called_once_with(11, 4096)
+        self.assertEqual(len(proxy._serial_tx_pending), 4096)
+
+    def test_loop_pauses_ptm_until_uart_drains_and_keeps_output_active(self):
+        proxy = self.proxy
+        proxy._serial_tx_pending.extend(b"input")
+        snapshots = []
+
+        def ready(read_fds, write_fds, error_fds, timeout):
+            snapshots.append((list(read_fds), list(write_fds)))
+            if len(snapshots) == 1:
+                return [proxy.ser_fd], [proxy.ser_fd], []
+            proxy.running = False
+            return [], [], []
+
+        with mock.patch.object(console_monitor.select, "select", side_effect=ready), \
+                mock.patch.object(console_monitor.os, "write", return_value=5), \
+                mock.patch.object(proxy, "_on_serial_read") as serial_read:
+            proxy._run_loop()
+        self.assertEqual(snapshots, [
+            ([12, 10], [10]), ([12, 10, 11], []),
+        ])
+        serial_read.assert_called_once()
+
+    def test_both_directions_can_backpressure_and_stop_remains_responsive(self):
+        proxy = self.proxy
+        proxy._serial_tx_pending.extend(b"input")
+        proxy._ptm_tx_pending.extend(b"output")
+        proxy._wake_w = 13
+        snapshots = []
+
+        def ready(read_fds, write_fds, error_fds, timeout):
+            snapshots.append((list(read_fds), list(write_fds), timeout))
+            proxy.stop()
+            return [proxy._wake_r], [], []
+
+        with mock.patch.object(console_monitor.select, "select", side_effect=ready), \
+                mock.patch.object(console_monitor.os, "write", return_value=1) as write:
+            proxy._run_loop()
+        self.assertEqual(snapshots[0][:2], ([12], [11, 10]))
+        self.assertGreater(snapshots[0][2], 0)
+        write.assert_called_once_with(13, b"x")
+        self.assertEqual(proxy._serial_tx_pending, b"input")
+        self.assertEqual(proxy._ptm_tx_pending, b"output")
+
+    @parameterized.expand([
+        ("zero_progress", 0),
+        ("permanent_error", OSError(errno.EIO, "UART disconnected")),
+    ])
+    def test_fatal_uart_write_returns_failure(self, _, result):
+        proxy = self.proxy
+        proxy._serial_tx_pending.extend(b"input")
+        with mock.patch.multiple(
+                proxy, _get_udev_prefix=mock.Mock(return_value=True),
+                _wait_for_config=mock.Mock(return_value=True),
+                _wait_for_device=mock.Mock(return_value=True),
+                _wait_for_ptm=mock.Mock(return_value=True),
+                _initialize=mock.Mock(return_value=True),
+                _run_loop=mock.Mock(side_effect=proxy._flush_serial_tx),
+                _cleanup=mock.Mock()), \
+                mock.patch.object(console_monitor.os, "write", side_effect=[result]), \
+                self.assertLogs(console_monitor.log, level="ERROR"):
+            self.assertEqual(proxy.run(), console_monitor.EXIT_SERVICE_START_FAILED)
+        self.assertFalse(proxy.running)
+        self.assertTrue(proxy._serial_write_failed)
+        self.assertEqual(proxy._serial_tx_pending, b"input")
+
+    @parameterized.expand([("drained", 5), ("blocked", BlockingIOError())])
+    def test_shutdown_drains_or_reports_pending_input(self, _, result):
+        proxy = self.proxy
+        proxy.running = False
+        proxy._serial_tx_pending.extend(b"input")
+        with mock.patch.object(console_monitor.os, "write", side_effect=[result]), \
+                mock.patch.object(console_monitor.os, "close"), \
+                mock.patch.object(console_monitor.log, "warning") as warning:
+            proxy._cleanup()
+        self.assertFalse(proxy._serial_tx_pending)
+        self.assertEqual(warning.call_count, int(isinstance(result, OSError)))
+
+    def test_real_nonblocking_uart_pipe_preserves_1000_lines(self):
+        proxy = self.proxy
+        uart_r, uart_w = os.pipe()
+        ptm_r, ptm_w = os.pipe()
+        proxy.ser_fd, proxy.ptm_fd = uart_w, ptm_r
+        expected = b"".join(f"COMMAND_{i:04d}\n".encode() for i in range(1000))
+        received = bytearray()
+        try:
+            for fd in (uart_r, uart_w, ptm_r, ptm_w):
+                console_monitor.set_nonblocking(fd)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(uart_w, b"z" * 4096)
+            os.write(ptm_w, expected[:4096])
+            proxy._on_ptm_read()
+            proxy._flush_serial_tx()
+            self.assertEqual(proxy._serial_tx_pending, expected[:4096])
+            proxy._on_ptm_read()
+            self.assertEqual(len(proxy._serial_tx_pending), 4096)
+            while True:
+                try:
+                    os.read(uart_r, 4096)
+                except BlockingIOError:
+                    break
+            for offset in range(0, len(expected), 4096):
+                if offset:
+                    chunk = expected[offset:offset + 4096]
+                    self.assertEqual(os.write(ptm_w, chunk), len(chunk))
+                    proxy._on_ptm_read()
+                for _ in range(100):
+                    if not proxy._serial_tx_pending:
+                        break
+                    proxy._flush_serial_tx()
+                    try:
+                        received.extend(os.read(uart_r, 1024))
+                    except BlockingIOError:
+                        pass
+                self.assertFalse(proxy._serial_tx_pending)
+            while True:
+                try:
+                    received.extend(os.read(uart_r, 4096))
+                except BlockingIOError:
+                    break
+            self.assertEqual(received, expected)
+        finally:
+            for fd in (uart_r, uart_w, ptm_r, ptm_w):
+                os.close(fd)
+
+
+class TestProxyFlowControl(TestCase):
+    """Apply CONFIG_DB flow control and restart when it changes."""
+
+    @parameterized.expand([("enabled", "1", True), ("disabled", "0", False), ("missing", None, False)])
+    def test_config_loading_and_uart_initialization(self, _, value, enabled):
+        proxy = console_monitor.ProxyService("1")
+        proxy.running = True
+        config_db = mock.Mock()
+        entry = {"baud_rate": "115200"}
+        if value is not None:
+            entry["flow_control"] = value
+        config_db.get_entry.return_value = entry
+        with mock.patch.object(console_monitor, "ConfigDBConnector", return_value=config_db):
+            self.assertTrue(proxy._wait_for_config())
+        self.assertEqual(proxy.flow_control, enabled)
+        with mock.patch.object(console_monitor, "DBConnector"), \
+                mock.patch.object(console_monitor, "Table"), \
+                mock.patch.object(console_monitor.os, "pipe", return_value=(10, 11)), \
+                mock.patch.object(console_monitor.os, "open", return_value=12), \
+                mock.patch.object(console_monitor, "set_nonblocking"), \
+                mock.patch.object(console_monitor, "configure_serial") as configure:
+            self.assertTrue(proxy._initialize())
+        configure.assert_called_once_with(12, 115200, enabled)
+
+    @parameterized.expand([("enable", True), ("clear_stale", False), ("default", None)])
+    def test_configure_serial_sets_or_clears_crtscts(self, _, enabled):
+        master, slave = os.openpty()
+        try:
+            attrs = termios.tcgetattr(master)
+            if enabled:
+                attrs[2] &= ~termios.CRTSCTS
+            else:
+                attrs[2] |= termios.CRTSCTS
+            termios.tcsetattr(master, termios.TCSANOW, attrs)
+            if enabled is None:
+                console_monitor.configure_serial(master, 9600)
+            else:
+                console_monitor.configure_serial(master, 9600, enabled)
+            self.assertEqual(bool(termios.tcgetattr(master)[2] & termios.CRTSCTS), bool(enabled))
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_dce_restarts_proxy_on_flow_control_change(self):
+        MockConfigDb.set_config_db(copy.deepcopy(DCE_3_LINKS_ENABLED_CONFIG_DB))
+        try:
+            service = console_monitor.DCEService()
+            service.config_db = MockConfigDb()
+            service.active_links = {"1", "2", "3"}
+            service._config_cache = service._get_all_configs()
+            MockConfigDb.CONFIG_DB["CONSOLE_PORT"]["1"]["flow_control"] = "1"
+            with mock.patch.object(service, "_sync_logrotate_configs"), \
+                    mock.patch.object(service, "_restart_link", return_value=True) as restart:
+                service._sync()
+            restart.assert_called_once_with("1")
+            self.assertEqual(service._config_cache["1"]["flow_control"], "1")
+        finally:
+            MockConfigDb.CONFIG_DB = None
+
 
 class TestProxyOutputBackpressure(TestCase):
     """Device output must survive a slow nonblocking PTM consumer."""
@@ -2512,17 +2739,20 @@ class TestProxyServicePhases(TestCase):
             proxy._on_serial_read()
     
     def test_proxy_on_ptm_read(self):
-        """Test _on_ptm_read forwards data to serial."""
+        """Test PTM input is queued before being forwarded to serial."""
         proxy = console_monitor.ProxyService(link_id="1")
         proxy.running = True
         proxy.ptm_fd = 10
         proxy.ser_fd = 11
         
         with mock.patch('os.read', return_value=b"user input"):
-            with mock.patch('os.write') as mock_write:
+            with mock.patch('os.write', return_value=10) as mock_write:
                 proxy._on_ptm_read()
-                
+                mock_write.assert_not_called()
+                self.assertEqual(proxy._serial_tx_pending, b"user input")
+                proxy._flush_serial_tx()
                 mock_write.assert_called_once_with(11, b"user input")
+                self.assertEqual(proxy._serial_tx_pending, b"")
 
     def test_proxy_on_ptm_read_does_not_log_input(self):
         """Test _on_ptm_read forwards to serial without logging (echo is logged on serial read)."""
@@ -2533,9 +2763,9 @@ class TestProxyServicePhases(TestCase):
         proxy.log_fd = 12
 
         with mock.patch('os.read', return_value=b"user input"):
-            with mock.patch('os.write') as mock_write:
+            with mock.patch('os.write', return_value=10) as mock_write:
                 proxy._on_ptm_read()
-
+                proxy._flush_serial_tx()
                 mock_write.assert_called_once_with(11, b"user input")
     
     def test_proxy_on_ptm_read_handles_blocking_error(self):
